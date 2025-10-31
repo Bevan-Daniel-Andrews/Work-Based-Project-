@@ -1,0 +1,1220 @@
+# Script: BES_analysis_updated_W30_plus
+# Purpose: Analysis of British Elections Study data for EIP Evaluation (W10+ incl. W30)
+# Analyst: Robert Blincoe
+# Team: Elections Research and Analysis
+
+# 1. Prepare Environment =======================================================
+
+if (!require("pacman")) {
+  install.packages("pacman")
+  library("pacman")
+}
+
+p_load(
+  tidyverse,
+  readxl,
+  foreign,
+  scales,
+  haven,
+  stringr,
+  install = TRUE
+)
+
+rm(list = ls())
+
+setwd("Q:/Constitution Group Analysis/ED_ad_hoc/BES_non_vote_reg")
+
+# 2. Load BES panel data =======================================================
+
+# Option A (haven) - usually faster/cleaner for labelled data
+# BES_data <- read_sav("Q:/Constitution Group Analysis/ED-BES-Data/BES2024_W30_Panel_v30.0.sav")
+# BES_data <- BES_data %>%
+#   mutate(across(where(haven::is.labelled), haven::as_factor))
+
+# Option B (foreign) - currently used in your script; update path to W30 file if needed
+BES_data <- read.spss(
+  "Q:/Constitution Group Analysis/ED-BES-Data/BES2024_W30_Panel_v30.0.sav",
+  to.data.frame = TRUE
+)
+
+BES_colnames <- as.data.frame(colnames(BES_data))
+
+# 3. Wave setup (auto-detect W10+) ============================================
+
+# Base demographic stems (wave-suffixed in data). Keep same list as your script.
+demographic_cols <- c(
+  "ageGroupW",
+  "p_educationW",
+  "p_housingW",
+  "p_maritalW",
+  "p_education_ageW",
+  "p_ethnicityW",
+  "p_socgradeW",
+  "oslaua_codeW",
+  "p_gross_householdW",
+  "p_hh_sizeW",
+  "p_hh_childrenW",
+  "p_paper_readW",
+  "p_religionW",
+  "churchAttendanceW",
+  "p_work_statW",
+  "p_country_birthW",
+  "p_disabilityW",
+  "genElecTurnoutRetroW",
+  "localTurnoutRetroW",
+  "p_turnout_2017",
+  "p_turnout_2019",
+  "polAttention" # if unsuffixed this will simply be ignored when selecting
+)
+
+# Detect wave* columns present and keep W10+
+all_wave_nums <- {
+  wave_flags <- grep("^wave\\d+$", names(BES_data), value = TRUE)
+  as.integer(gsub("^wave", "", wave_flags))
+}
+waves_keep <- sort(unique(all_wave_nums[all_wave_nums >= 10]))
+
+# Build per-wave name sets
+wave_cols       <- paste0("wave", waves_keep)
+registered_cols <- paste0("registeredW", waves_keep)
+
+make_dynamic <- function(stem) paste0(stem, waves_keep)
+dynamic_cols <- unlist(lapply(demographic_cols, make_dynamic))
+
+# Detect available weight columns for kept waves (supports *_result suffix)
+wt_cols_regex <- paste0("^wt_.*W(", paste(waves_keep, collapse = "|"), ")(?:_result)?$")
+wt_cols <- names(BES_data)[grepl(wt_cols_regex, names(BES_data))]
+
+# Static columns you use later
+static_columns <- c("id", "p_turnout_2017", "p_turnout_2019", "genElecTurnoutRetro2017W18")
+
+# Select only columns that actually exist
+available_columns <- names(BES_data)[
+  names(BES_data) %in% c(
+    static_columns,
+    wave_cols,
+    registered_cols,
+    dynamic_cols,
+    wt_cols
+  )
+]
+
+# Filter to rows with data in at least one kept wave
+BES_filtered_w10_wXX <- BES_data %>%
+  select(all_of(available_columns)) %>%
+  filter(rowSums(!is.na(select(., starts_with("wave")))) > 0)
+
+# Back-compat object name used throughout the original script
+BES_filtered_w10_w29 <- BES_filtered_w10_wXX
+
+# Free memory / optional save+reload
+rm(BES_data)
+gc()
+
+saveRDS(BES_filtered_w10_w29, file = "BES_filtered_w10_w29.rds")
+BES_filtered_w10_w29 <- readRDS("BES_filtered_w10_w29.rds")
+
+BES_filtered_w10_w29_colnames <- as.data.frame(colnames(BES_filtered_w10_w29))
+
+# 4. Registration long table + dynamic weights =================================
+
+BES_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("registeredW"),
+    names_to = "wave_label",
+    values_to = "registered"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("registeredW", "", wave_label)),
+    registered = as.character(registered),
+    registered = case_when(
+      registered %in% c("Yes - at $postcode_hidden", "Yes - another address") ~ "Yes",
+      registered == "No" ~ "No",
+      registered == "Don't know" ~ "Don't know",
+      TRUE ~ registered
+    ),
+    registered = factor(registered, levels = c("Yes", "No", "Don't know"))
+  ) %>%
+  filter(!is.na(registered)) %>%
+  select(id, wave, registered)
+
+# Build a long weights table by extracting wave from column names and join
+weights_long <- BES_filtered_w10_w29 %>%
+  select(id, matches("^wt_.*W\\d+(?:_result)?$")) %>%
+  pivot_longer(
+    cols = -id,
+    names_to = "weight_col",
+    values_to = "weight"
+  ) %>%
+  mutate(wave = as.numeric(str_match(weight_col, "W(\\d+)")[, 2])) %>%
+  filter(!is.na(wave)) %>%
+  select(id, wave, weight)
+
+# Join per-(id, wave) weight
+BES_long <- BES_long %>%
+  left_join(weights_long, by = c("id", "wave"))
+
+# 5. Wave start dates (add known dates; W30 left NA unless known) =============
+
+wave_start_dates <- tibble(
+  wave = waves_keep,
+  wave_start_date = as.Date(NA)
+) %>%
+  rows_update(
+    tibble(
+      wave = 10:30,
+      wave_start_date = as.Date(c(
+        "2016-11-24","2017-04-24","2017-05-05","2017-06-09","2018-05-04",
+        "2019-03-11","2019-05-24","2019-11-01","2019-11-13","2019-12-13",
+        "2020-06-03","2021-05-07","2021-11-26","2022-05-06","2022-12-01",
+        "2023-05-05","2024-05-03","2024-05-24","2024-06-10","2024-07-05",
+        NA # <-- fill W30 start date when confirmed
+      ))
+    ),
+    by = "wave"
+  )
+
+BES_long <- BES_long %>%
+  mutate(wave = as.numeric(wave)) %>%
+  left_join(wave_start_dates, by = "wave")
+
+saveRDS(BES_long, file = "BES_long.rds")
+BES_long <- readRDS("BES_long.rds")
+
+# 6. Weighted proportions (overall) ===========================================
+
+proportion_data <- BES_long %>%
+  group_by(wave, wave_start_date, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  ungroup()
+
+# 7. Plot function & palette ===================================================
+
+base_palette <- c(
+  "#12436D", "#28A197", "#801650", "#F46A25", "#3D3D3D", "#A285D1"
+)
+
+plot_proportion_trends <- function(
+  data,
+  x_var = "wave_start_date",
+  color_var,
+  facet_var = NULL,
+  title = "Proportion Trends",
+  x_label = "Wave start date",
+  y_label = "Proportion",
+  filter_expr = NULL,
+  is_date_x = TRUE,
+  add_points = TRUE,
+  weighted = TRUE
+) {
+  if (!is.null(filter_expr)) {
+    data <- data %>% filter(!!rlang::parse_expr(filter_expr))
+  }
+  data <- data %>% droplevels()
+  color_levels <- unique(data[[color_var]])
+  color_values <- setNames(rep(base_palette, length.out = length(color_levels)), color_levels)
+
+  p <- ggplot(data, aes(x = .data[[x_var]], y = proportion, color = .data[[color_var]])) +
+    geom_line() +
+    theme_minimal() +
+    labs(
+      title = paste0(title, if (weighted) " (Weighted)" else ""),
+      x = x_label, y = y_label,
+      color = stringr::str_to_title(gsub("_", " ", color_var))
+    ) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(color = "grey90"),
+      axis.line.x = element_line(color = "grey40"),
+      axis.ticks.x = element_line(color = "grey40"),
+      axis.ticks.length = unit(4, "pt")
+    ) +
+    scale_color_manual(values = color_values) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_x_date(date_labels = "%Y", date_breaks = "12 months", expand = expansion(mult = c(0.01, 0.01)))
+
+  if (add_points) p <- p + geom_point(size = 2)
+
+  if (!is.null(facet_var)) {
+    n_facets <- length(unique(data[[facet_var]]))
+    if (n_facets <= 2) p <- p + facet_grid(rows = vars(!!sym(facet_var)))
+    else p <- p + facet_wrap(as.formula(paste("~", facet_var)))
+  }
+  p
+}
+
+# Example plot (optional)
+# plot_proportion_trends(proportion_data, color_var = "registered",
+#                        title = "Proportion of Responses by Registration Status")
+
+# 8. AGE =======================================================================
+
+age_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("ageGroupW"),
+    names_to = "wave_label",
+    values_to = "ageGroup"
+  ) %>%
+  mutate(wave = as.numeric(gsub("ageGroupW", "", wave_label))) %>%
+  filter(!is.na(ageGroup)) %>%
+  select(id, wave, ageGroup)
+
+BES_age_long <- BES_long %>%
+  left_join(age_long, by = c("id", "wave")) %>%
+  filter(!is.na(ageGroup)) %>%
+  select(id, wave, wave_start_date, registered, ageGroup, weight)
+
+saveRDS(BES_age_long, file = "BES_age_long.rds")
+
+proportion_age_data <- BES_age_long %>%
+  group_by(wave_start_date, ageGroup, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, ageGroup) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, ageGroup, registered, proportion)
+
+# plot_proportion_trends(proportion_age_data, color_var = "registered",
+#                        facet_var = "ageGroup", title = "Proportion by Age Group and Registration")
+# plot_proportion_trends(proportion_age_data, color_var = "ageGroup",
+#                        title = "Trends in Non-Registration by Age Group",
+#                        filter_expr = "registered == 'No'", is_date_x = FALSE)
+
+age_group_counts <- BES_age_long %>%
+  group_by(wave_start_date, ageGroup) %>%
+  summarise(n_unweighted = n(), n_weighted = sum(weight, na.rm = TRUE), .groups = "drop")
+
+avg_weighted_n_age <- age_group_counts %>%
+  group_by(ageGroup) %>%
+  summarise(avg_weighted_n = mean(n_weighted), .groups = "drop")
+
+age_summary <- proportion_age_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(ageGroup) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  )
+
+age_summary_combined <- age_summary %>%
+  left_join(avg_weighted_n_age, by = "ageGroup") %>%
+  arrange(desc(non_registration_ratio))
+
+# 9. EDUCATION (multi) =========================================================
+
+education_long_reduced <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_educationW"),
+    names_to = "wave_label",
+    values_to = "education"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_educationW", "", wave_label))) %>%
+  filter(!is.na(education)) %>%
+  mutate(education = as.character(education)) %>%
+  mutate(education = case_when(
+    education == "No formal qualifications" ~ "No Formal Qualifications",
+    education %in% c(
+      "Youth training certificate/skillseekers",
+      "Recognised trade apprenticeship completed",
+      "Clerical and commercial",
+      "City & Guilds certificate",
+      "City & Guilds certificate - advanced",
+      "ONC"
+    ) ~ "Vocational & Apprenticeships",
+    education %in% c(
+      "CSE grades 2-5",
+      "CSE grade 1, GCE O level, GCSE, School Certificate",
+      "Scottish Ordinary/ Lower Certificate"
+    ) ~ "Basic Secondary Education",
+    education %in% c(
+      "GCE A level or Higher Certificate",
+      "Scottish Higher Certificate"
+    ) ~ "Advanced Secondary Education",
+    education %in% c(
+      "Nursing qualification (e.g. SEN, SRN, SCM, RGN)",
+      "Teaching qualification (not degree)"
+    ) ~ "Professional & Teaching Qualifications",
+    education %in% c(
+      "University diploma",
+      "University or CNAA first degree (e.g. BA, B.Sc, B.Ed)",
+      "University or CNAA higher degree (e.g. M.Sc, Ph.D)"
+    ) ~ "Higher Education",
+    TRUE ~ education
+  )) %>%
+  select(id, wave, education)
+
+BES_ed_long <- BES_long %>%
+  left_join(education_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(education)) %>%
+  select(id, wave, wave_start_date, registered, education, weight)
+
+saveRDS(BES_ed_long, file = "BES_ed_long.rds")
+
+proportion_ed_data <- BES_ed_long %>%
+  group_by(wave_start_date, education, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, education) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, education, registered, proportion)
+
+# 10. EDUCATION (binary) =======================================================
+
+education_uni_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_educationW"),
+    names_to = "wave_label",
+    values_to = "education"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_educationW", "", wave_label))) %>%
+  filter(!is.na(education)) %>%
+  mutate(education = as.character(education)) %>%
+  mutate(education_binary = case_when(
+    education %in% c(
+      "University diploma",
+      "University or CNAA first degree (e.g. BA, B.Sc, B.Ed)",
+      "University or CNAA higher degree (e.g. M.Sc, Ph.D)"
+    ) ~ "University",
+    TRUE ~ "Non-University"
+  )) %>%
+  select(id, wave, education_binary)
+
+BES_ed_uni_long <- BES_long %>%
+  left_join(education_uni_long, by = c("id", "wave")) %>%
+  filter(!is.na(education_binary)) %>%
+  select(id, wave, wave_start_date, registered, education_binary, weight)
+
+saveRDS(BES_ed_uni_long, file = "BES_ed_uni_long.rds")
+
+proportion_ed_data <- BES_ed_uni_long %>%
+  group_by(wave_start_date, education_binary, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, education_binary) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, education_binary, registered, proportion)
+
+avg_weighted_n_ed_binary <- BES_ed_uni_long %>%
+  group_by(wave_start_date, education_binary) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(education_binary) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+education_binary_summary <- proportion_ed_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(education_binary) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  )
+
+education_binary_summary_combined <- education_binary_summary %>%
+  left_join(avg_weighted_n_ed_binary, by = "education_binary") %>%
+  arrange(desc(non_registration_ratio))
+
+# 11. HOUSING ==================================================================
+
+housing_long_reduced <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_housingW"),
+    names_to = "wave_label",
+    values_to = "housing"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_housingW", "", wave_label))) %>%
+  mutate(housing = as.character(housing)) %>%
+  mutate(housing = case_when(
+    housing %in% c(
+      "Own – outright",
+      "Own – with a mortgage",
+      "Own (part-own) – through shared ownership scheme (i.e. pay part mortgage, part rent)"
+    ) ~ "Own",
+    housing %in% c(
+      "Rent – from a private landlord",
+      "Rent – from my local authority",
+      "Rent – from a housing association"
+    ) ~ "Rent",
+    housing %in% c(
+      "Neither – I live with my parents, family or friends but pay some rent to them",
+      "Neither – I live rent-free with my parents, family or friends"
+    ) ~ "Neither",
+    TRUE ~ "Other"
+  )) %>%
+  select(id, wave, housing)
+
+BES_housing_long <- BES_long %>%
+  left_join(housing_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(housing)) %>%
+  select(id, wave, wave_start_date, registered, housing, weight)
+
+saveRDS(BES_housing_long, file = "BES_housing_long.rds")
+
+proportion_housing_data <- BES_housing_long %>%
+  group_by(wave_start_date, housing, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, housing) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, housing, registered, proportion)
+
+avg_weighted_n_housing <- BES_housing_long %>%
+  group_by(wave_start_date, housing) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(housing) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+housing_summary <- proportion_housing_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(housing) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_housing, by = "housing") %>%
+  arrange(desc(non_registration_ratio))
+
+# 12. MARITAL ==================================================================
+
+marital_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_maritalW"),
+    names_to = "wave_label",
+    values_to = "marital"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_maritalW", "", wave_label))) %>%
+  select(id, wave, marital)
+
+marital_long_reduced <- marital_long %>%
+  mutate(marital = case_when(
+    marital %in% c("Married", "In a civil partnership") ~ "Married / Civil Partnership",
+    marital %in% c("Separated but still legally married or in a civil partnership", "Divorced", "Widowed") ~ "Separated / Divorced / Widowed",
+    marital %in% c("Living with a partner but neither married nor in a civil partnership", "In a relationship, but not living together") ~ "Cohabiting / In a Relationship",
+    marital == "Single" ~ "Single",
+    TRUE ~ marital
+  ))
+
+BES_marital_long_reduced <- BES_long %>%
+  left_join(marital_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(marital)) %>%
+  select(id, wave, wave_start_date, registered, marital, weight)
+
+saveRDS(BES_marital_long_reduced, file = "BES_marital_long_reduced.rds")
+
+proportion_marital_data_reduced <- BES_marital_long_reduced %>%
+  group_by(wave_start_date, marital, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, marital) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, marital, registered, proportion)
+
+avg_weighted_n_marital <- BES_marital_long_reduced %>%
+  group_by(wave_start_date, marital) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(marital) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+marital_summary <- proportion_marital_data_reduced %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(marital) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_marital, by = "marital") %>%
+  arrange(desc(non_registration_ratio))
+
+# 13. ETHNICITY ================================================================
+
+ethnicity_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_ethnicityW"),
+    names_to = "wave_label",
+    values_to = "ethnicity"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_ethnicityW", "", wave_label))) %>%
+  select(id, wave, ethnicity)
+
+ethnicity_long_reduced <- ethnicity_long %>%
+  mutate(
+    ethnicity = case_when(
+      ethnicity %in% c("White British", "Any other white background") ~ "White",
+      ethnicity %in% c("White and Black Caribbean", "White and Black African", "White and Asian", "Any other mixed background") ~ "Mixed",
+      ethnicity %in% c("Indian", "Pakistani", "Bangladeshi") ~ "South Asian",
+      ethnicity %in% c("Black Caribbean", "Black African", "Any other black background") ~ "Black",
+      ethnicity %in% c("Chinese", "Any other Asian background") ~ "Other Asian + Chinese",
+      ethnicity == "Other ethnic group" ~ "Other",
+      ethnicity == "Prefer not to say" ~ "Prefer not to say",
+      TRUE ~ ethnicity
+    )
+  )
+
+BES_ethnicity_long_reduced <- BES_long %>%
+  left_join(ethnicity_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(ethnicity)) %>%
+  select(id, wave, wave_start_date, registered, ethnicity, weight)
+
+saveRDS(BES_ethnicity_long_reduced, file = "BES_ethnicity_long_reduced.rds")
+
+proportion_ethnicity_data_reduced <- BES_ethnicity_long_reduced %>%
+  group_by(wave_start_date, ethnicity, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, ethnicity) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, ethnicity, registered, proportion)
+
+avg_weighted_n_ethnicity <- BES_ethnicity_long_reduced %>%
+  group_by(wave_start_date, ethnicity) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(ethnicity) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+ethnicity_summary_reduced <- proportion_ethnicity_data_reduced %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(ethnicity) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_ethnicity, by = "ethnicity") %>%
+  arrange(desc(non_registration_ratio))
+
+# 14. SOCIAL GRADE =============================================================
+
+socgrade_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_socgradeW"),
+    names_to = "wave_label",
+    values_to = "socgrade"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_socgradeW", "", wave_label))) %>%
+  filter(!is.na(socgrade)) %>%
+  filter(!socgrade %in% c("Unknown", "Refused")) %>%
+  select(id, wave, socgrade)
+
+BES_socgrade_long <- BES_long %>%
+  left_join(socgrade_long, by = c("id", "wave")) %>%
+  filter(!is.na(socgrade)) %>%
+  select(id, wave, wave_start_date, registered, socgrade, weight)
+
+saveRDS(BES_socgrade_long, file = "BES_socgrade_long.rds")
+
+proportion_socgrade_data <- BES_socgrade_long %>%
+  group_by(wave_start_date, socgrade, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, socgrade) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  filter(!is.na(socgrade)) %>%
+  select(wave_start_date, socgrade, registered, proportion) %>%
+  droplevels()
+
+avg_weighted_n_socgrade <- BES_socgrade_long %>%
+  group_by(wave_start_date, socgrade) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(socgrade) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+socgrade_summary <- proportion_socgrade_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(socgrade) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_socgrade, by = "socgrade") %>%
+  arrange(desc(non_registration_ratio))
+
+# 15. INCOME ===================================================================
+
+gross_household_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_gross_householdW"),
+    names_to = "wave_label",
+    values_to = "gross_household"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_gross_householdW", "", wave_label)),
+    gross_household = case_when(
+      gross_household %in% c("under £5,000 per year","£5,000 to £9,999 per year","£10,000 to £14,999 per year") ~ "Up to £14,999",
+      gross_household %in% c("£15,000 to £19,999 per year","£20,000 to £24,999 per year","£25,000 to £29,999 per year") ~ "£15,000 to £29,999",
+      gross_household %in% c("£30,000 to £34,999 per year","£35,000 to £39,999 per year","£40,000 to £44,999 per year","£45,000 to £49,999 per year") ~ "£30,000 to £49,999",
+      gross_household %in% c("£50,000 to £59,999 per year","£60,000 to £69,999 per year","£70,000 to £99,999 per year") ~ "£50,000 to £99,999",
+      gross_household %in% c("£100,000 to £149,999 per year","£150,000 and over") ~ "Over £100,000",
+      gross_household == "Don't know" ~ "Don't know",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(gross_household)) %>%
+  select(id, wave, gross_household)
+
+BES_gross_household_long <- BES_long %>%
+  left_join(gross_household_long, by = c("id", "wave")) %>%
+  filter(!is.na(gross_household)) %>%
+  select(id, wave, wave_start_date, registered, gross_household, weight)
+
+saveRDS(BES_gross_household_long, file = "BES_gross_household_long.rds")
+
+proportion_gross_household_data <- BES_gross_household_long %>%
+  group_by(wave_start_date, gross_household, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, gross_household) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, gross_household, registered, proportion)
+
+avg_weighted_n_income <- BES_gross_household_long %>%
+  group_by(wave_start_date, gross_household) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(gross_household) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+income_summary <- proportion_gross_household_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(gross_household) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_income, by = "gross_household") %>%
+  arrange(desc(non_registration_ratio))
+
+# 16. HOUSEHOLD SIZE ===========================================================
+
+hh_size_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_hh_sizeW"),
+    names_to = "wave_label",
+    values_to = "household_size"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_hh_sizeW", "", wave_label)),
+    household_size = as.numeric(as.character(household_size)),
+    household_size_reduced = case_when(
+      household_size == 1 ~ "Single-person household",
+      household_size %in% 2:3 ~ "Small household (2-3 people)",
+      household_size %in% 4:5 ~ "Medium household (4-5 people)",
+      household_size >= 6 ~ "Large household (6 or more)",
+      household_size %in% c(9, 10) ~ "Unknown",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(id, wave, household_size_reduced)
+
+BES_hh_size_long <- BES_long %>%
+  left_join(hh_size_long, by = c("id", "wave")) %>%
+  filter(!is.na(household_size_reduced)) %>%
+  select(id, wave, wave_start_date, registered, household_size_reduced, weight)
+
+saveRDS(BES_hh_size_long, file = "BES_hh_size_long.rds")
+
+proportion_hh_size_data <- BES_hh_size_long %>%
+  group_by(wave_start_date, household_size_reduced, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, household_size_reduced) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, household_size_reduced, registered, proportion)
+
+avg_weighted_n_hh_size <- BES_hh_size_long %>%
+  group_by(wave_start_date, household_size_reduced) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(household_size_reduced) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+hh_size_summary <- proportion_hh_size_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(household_size_reduced) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_hh_size, by = "household_size_reduced") %>%
+  arrange(desc(non_registration_ratio))
+
+# 17. CHILDREN IN HOUSEHOLD ====================================================
+
+hh_children_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_hh_childrenW"),
+    names_to = "wave_label",
+    values_to = "household_children"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_hh_childrenW", "", wave_label)),
+    household_children = as.numeric(as.character(household_children)),
+    household_children_reduced = case_when(
+      household_children == 0 ~ "No children",
+      household_children == 1 ~ "One child",
+      household_children %in% c(2, 3) ~ "Two or three children",
+      household_children >= 4 ~ "Four or more children",
+      household_children %in% c(8, 9) ~ "Unknown",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(id, wave, household_children_reduced)
+
+BES_children_long <- BES_long %>%
+  left_join(hh_children_long, by = c("id", "wave")) %>%
+  filter(!is.na(household_children_reduced)) %>%
+  select(id, wave, wave_start_date, registered, household_children_reduced, weight)
+
+saveRDS(BES_children_long, file = "BES_children_long.rds")
+
+proportion_children_data <- BES_children_long %>%
+  group_by(wave_start_date, household_children_reduced, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, household_children_reduced) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, household_children_reduced, registered, proportion)
+
+avg_weighted_n_children <- BES_children_long %>%
+  group_by(wave_start_date, household_children_reduced) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(household_children_reduced) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+children_summary <- proportion_children_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(household_children_reduced) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_children, by = "household_children_reduced") %>%
+  arrange(desc(non_registration_ratio))
+
+# 18. NEWSPAPER CATEGORY =======================================================
+
+paper_read_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_paper_readW"),
+    names_to = "wave_label",
+    values_to = "newspaper"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_paper_readW", "", wave_label)),
+    newspaper = trimws(as.character(newspaper)),
+    paper_category = case_when(
+      is.na(newspaper) ~ "Missing/No response",
+      str_detect(newspaper, regex("^none$|^no daily morning newspaper$|^no newspaper$", ignore_case = TRUE)) ~ "Non-newspaper",
+      newspaper %in% c("The Express", "The Daily Mail / The Scottish Daily Mail", "The Sun", "The Mirror / Daily Record", "The Daily Star / The Daily Star of Scotland") ~ "Tabloid",
+      newspaper %in% c("The Daily Telegraph", "The Financial Times", "The Guardian", "The Independent", "The Times") ~ "Broadsheet",
+      newspaper %in% c("The Scotsman", "The Herald (Glasgow)", "The Western Mail") ~ "Regional",
+      newspaper %in% c("Other local daily morning newspaper", "Other Newspaper") ~ "Other Local Newspapers",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(id, wave, paper_category)
+
+BES_paper_long <- BES_long %>%
+  left_join(paper_read_long, by = c("id", "wave")) %>%
+  mutate(paper_category = coalesce(paper_category, "Missing/No response")) %>%
+  select(id, wave, wave_start_date, registered, paper_category, weight)
+
+saveRDS(BES_paper_long, file = "BES_paper_long.rds")
+
+proportion_paper_data <- BES_paper_long %>%
+  group_by(wave_start_date, paper_category, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, paper_category) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, paper_category, registered, proportion)
+
+avg_weighted_n_paper <- BES_paper_long %>%
+  group_by(wave_start_date, paper_category) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(paper_category) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+paper_summary <- proportion_paper_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(paper_category) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_paper, by = "paper_category") %>%
+  arrange(desc(non_registration_ratio))
+
+# 19. RELIGION & CHURCH ATTENDANCE ============================================
+
+religion_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_religionW"),
+    names_to = "wave_label",
+    values_to = "religion"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_religionW", "", wave_label))) %>%
+  mutate(
+    religion = case_when(
+      religion == "No, I do not regard myself as belonging to any particular religion." ~ "No Religion",
+      religion %in% c(
+        "Yes - Church of England/Anglican/Episcopal","Yes - Roman Catholic","Yes - Presbyterian/Church of Scotland","Yes - Methodist","Yes - Baptist","Yes - United Reformed Church","Yes - Free Presbyterian","Yes - Brethren","Yes – Orthodox Christian","Yes - Pentecostal (e.g. Assemblies of God, Elim Pentecostal Church, New Testament Church of God, Redeemed Christian Chur","Yes - Evangelical – independent/non-denominational (e.g. FIEC, Pioneer, Vineyard, Newfrontiers)"
+      ) ~ "Christian",
+      religion == "Yes - Judaism" ~ "Jewish",
+      religion == "Yes - Hinduism" ~ "Hindu",
+      religion == "Yes - Islam" ~ "Muslim",
+      religion == "Yes - Sikhism" ~ "Sikh",
+      religion == "Yes - Buddhism" ~ "Buddhist",
+      religion == "Yes - Other" ~ "Other Religion",
+      religion == "Prefer not to say" ~ "Prefer Not to Say",
+      TRUE ~ religion
+    )
+  ) %>%
+  select(id, wave, religion)
+
+BES_religion_long <- BES_long %>%
+  left_join(religion_long, by = c("id", "wave")) %>%
+  filter(!is.na(religion)) %>%
+  select(id, wave, wave_start_date, registered, religion, weight)
+
+saveRDS(BES_religion_long, file = "BES_religion_long.rds")
+
+proportion_religion_data <- BES_religion_long %>%
+  group_by(wave_start_date, religion, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, religion) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, religion, registered, proportion)
+
+church_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("churchAttendanceW"),
+    names_to = "wave_label",
+    values_to = "churchAttendance"
+  ) %>%
+  mutate(wave = as.numeric(gsub("churchAttendanceW", "", wave_label))) %>%
+  filter(!is.na(churchAttendance)) %>%
+  select(id, wave, churchAttendance)
+
+church_long_reduced <- church_long %>%
+  mutate(
+    churchAttendance = case_when(
+      churchAttendance == "I am not religious" ~ "Not Religious",
+      churchAttendance %in% c("Never or practically never","Less often than once a year","Less often but at least once a year","Less often but at least twice a year") ~ "Infrequent",
+      churchAttendance %in% c("Less often but at least once a month","Less often but at least once in two weeks") ~ "Monthly or Fortnightly",
+      churchAttendance == "Once a week or more" ~ "Weekly or More",
+      churchAttendance %in% c("Varies too much to say", "Don't know") ~ "Can't say/Don't know",
+      TRUE ~ churchAttendance
+    )
+  )
+
+BES_church_long <- BES_long %>%
+  left_join(church_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(churchAttendance)) %>%
+  select(id, wave, wave_start_date, registered, churchAttendance, weight)
+
+saveRDS(BES_church_long, file = "BES_church_long.rds")
+
+proportion_church_data <- BES_church_long %>%
+  group_by(wave_start_date, churchAttendance, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, churchAttendance) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, churchAttendance, registered, proportion)
+
+church_sample_sizes <- BES_church_long %>%
+  group_by(wave_start_date, churchAttendance) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(churchAttendance) %>%
+  summarise(avg_weighted_n = mean(weighted_n), .groups = "drop")
+
+church_summary <- proportion_church_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(churchAttendance) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(church_sample_sizes, by = "churchAttendance") %>%
+  arrange(desc(non_registration_ratio))
+
+# 20. WORK STATUS ===============================================================
+
+work_stat_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_work_statW"),
+    names_to = "wave_label",
+    values_to = "work_stat"
+  ) %>%
+  mutate(wave = as.numeric(gsub("p_work_statW", "", wave_label))) %>%
+  select(id, wave, work_stat)
+
+work_long_reduced <- work_stat_long %>%
+  mutate(
+    work_status = case_when(
+      work_stat %in% c("Working full time (30 or more hours per week)","Working part time (8-29 hours a week)","Working part time (Less than 8 hours a week)") ~ "Employed",
+      work_stat == "Full time student" ~ "Student",
+      work_stat == "Retired" ~ "Retired",
+      work_stat %in% c("Unemployed", "Not working") ~ "Unemployed/Inactive",
+      work_stat == "Other" ~ "Other",
+      TRUE ~ NA_character_
+    )
+  )
+
+BES_work_stat_long <- BES_long %>%
+  left_join(work_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(work_status)) %>%
+  select(id, wave, wave_start_date, registered, work_status, weight)
+
+saveRDS(BES_work_stat_long, file = "BES_work_stat_long.rds")
+
+proportion_work_stat_data <- BES_work_stat_long %>%
+  group_by(wave_start_date, work_status, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, work_status) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, work_status, registered, proportion)
+
+sample_size_work <- BES_work_stat_long %>%
+  group_by(wave_start_date, work_status) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(work_status) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(avg_weighted_n))
+
+work_summary <- proportion_work_stat_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(work_status) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(sample_size_work, by = "work_status") %>%
+  arrange(desc(non_registration_ratio))
+
+# 21. COUNTRY OF BIRTH ==========================================================
+
+country_birth_long_reduced <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_country_birthW"),
+    names_to = "wave_label",
+    values_to = "country_birth"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_country_birthW", "", wave_label)),
+    country_birth_grouped = case_when(
+      country_birth %in% c("UK", "Ireland") ~ "UK & Ireland",
+      country_birth %in% c("EU: pre-2004", "EU: post-2004", "European outside EU") ~ "Europe",
+      country_birth == "Not coded" ~ NA_character_,
+      TRUE ~ "Rest of World"
+    )
+  ) %>%
+  filter(!is.na(country_birth_grouped)) %>%
+  select(id, wave, country_birth_grouped)
+
+BES_country_birth_long <- BES_long %>%
+  left_join(country_birth_long_reduced, by = c("id", "wave")) %>%
+  filter(!is.na(country_birth_grouped)) %>%
+  select(id, wave, wave_start_date, registered, country_birth_grouped, weight)
+
+saveRDS(BES_country_birth_long, file = "BES_country_birth_long.rds")
+
+proportion_country_birth_data <- BES_country_birth_long %>%
+  group_by(wave_start_date, country_birth_grouped, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, country_birth_grouped) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, country_birth_grouped, registered, proportion)
+
+summary_country_birth <- proportion_country_birth_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(country_birth_grouped) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  )
+
+sample_sizes_country <- BES_country_birth_long %>%
+  group_by(wave_start_date, country_birth_grouped) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(country_birth_grouped) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+summary_country_birth_combined <- summary_country_birth %>%
+  left_join(sample_sizes_country, by = "country_birth_grouped") %>%
+  arrange(desc(non_registration_ratio))
+
+# 22. DISABILITY ================================================================
+
+disability_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("p_disabilityW"),
+    names_to = "wave_label",
+    values_to = "disability"
+  ) %>%
+  mutate(
+    wave = as.numeric(gsub("p_disabilityW", "", wave_label)),
+    disability = case_when(
+      disability == "Yes, limited a little" ~ "Limited a little",
+      disability == "Yes, limited a lot" ~ "Limited a lot",
+      disability == "No" ~ "Not limited",
+      TRUE ~ NA_character_
+    ),
+    disability = factor(disability, levels = c("Not limited", "Limited a little", "Limited a lot"))
+  ) %>%
+  select(id, wave, disability)
+
+BES_disability_long <- BES_long %>%
+  left_join(disability_long, by = c("id", "wave")) %>%
+  filter(!is.na(disability)) %>%
+  select(id, wave, wave_start_date, disability, registered, weight)
+
+saveRDS(BES_disability_long, file = "BES_disability_long.rds")
+
+proportion_disability_data <- BES_disability_long %>%
+  group_by(wave_start_date, disability, registered) %>%
+  summarise(count = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(wave_start_date, disability) %>%
+  mutate(proportion = count / sum(count, na.rm = TRUE)) %>%
+  select(wave_start_date, disability, registered, proportion)
+
+avg_weighted_n_disability <- BES_disability_long %>%
+  group_by(wave_start_date, disability) %>%
+  summarise(weighted_n = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  group_by(disability) %>%
+  summarise(avg_weighted_n = mean(weighted_n, na.rm = TRUE), .groups = "drop")
+
+disability_summary_combined <- proportion_disability_data %>%
+  pivot_wider(names_from = registered, values_from = proportion) %>%
+  group_by(disability) %>%
+  summarise(
+    avg_no = mean(`No`, na.rm = TRUE),
+    avg_yes = mean(`Yes`, na.rm = TRUE),
+    non_registration_ratio = avg_no / (avg_yes + avg_no),
+    .groups = "drop"
+  ) %>%
+  left_join(avg_weighted_n_disability, by = "disability") %>%
+  arrange(desc(non_registration_ratio))
+
+# 23. Save all long tables ======================================================
+
+rds_objects <- list(
+  BES_age_long = "BES_age_long.rds",
+  BES_children_long = "BES_children_long.rds",
+  BES_church_long = "BES_church_long.rds",
+  BES_country_birth_long = "BES_country_birth_long.rds",
+  BES_disability_long = "BES_disability_long.rds",
+  BES_ed_long = "BES_ed_long.rds",
+  BES_ed_uni_long = "BES_ed_uni_long.rds",
+  BES_ethnicity_long_reduced = "BES_ethnicity_long_reduced.rds",
+  BES_gross_household_long = "BES_gross_household_long.rds",
+  BES_hh_size_long = "BES_hh_size_long.rds",
+  BES_housing_long = "BES_housing_long.rds",
+  BES_marital_long_reduced = "BES_marital_long_reduced.rds",
+  BES_paper_long = "BES_paper_long.rds",
+  BES_socgrade_long = "BES_socgrade_long.rds",
+  BES_work_stat_long = "BES_work_stat_long.rds",
+  BES_religion_long = "BES_religion_long.rds"
+)
+
+for (var_name in names(rds_objects)) {
+  if (exists(var_name, inherits = FALSE)) {
+    saveRDS(get(var_name), file = rds_objects[[var_name]])
+  }
+}
+
+# 24. LOCAL AUTHORITY (auto: latest 3 waves; uses per-wave weights) ============
+
+# Determine last three waves present in BES_long (e.g., 28–30)
+max_wave <- max(BES_long$wave, na.rm = TRUE)
+last_three <- seq(max_wave - 2, max_wave)
+
+# Participation flags (waveXX==1) to long
+participation_long <- BES_filtered_w10_w29 %>%
+  select(id, all_of(paste0("wave", last_three))) %>%
+  pivot_longer(
+    cols = -id,
+    names_to = "wave_flag",
+    values_to = "in_wave"
+  ) %>%
+  mutate(wave = as.numeric(gsub("^wave", "", wave_flag))) %>%
+  select(-wave_flag)
+
+# ONS LA codes to long
+oslaua_long <- BES_filtered_w10_w29 %>%
+  pivot_longer(
+    cols = starts_with("oslaua_codeW"),
+    names_to = "wave_label",
+    values_to = "oslaua"
+  ) %>%
+  mutate(wave = as.numeric(gsub("oslaua_codeW", "", wave_label))) %>%
+  select(id, wave, oslaua)
+
+# Most recent valid LA per person among the last three waves and participated
+oslaua_latest <- oslaua_long %>%
+  inner_join(participation_long, by = c("id", "wave")) %>%
+  filter(wave %in% last_three, isTRUE(in_wave == 1), !is.na(oslaua), oslaua != "") %>%
+  group_by(id) %>%
+  arrange(desc(wave), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(id, wave, oslaua)
+
+# Registration + weight for those (id, wave)
+oslaua_registration <- BES_long %>%
+  semi_join(oslaua_latest, by = c("id", "wave")) %>%
+  left_join(oslaua_latest, by = c("id", "wave")) %>%
+  mutate(oslaua = str_trim(oslaua)) %>%
+  filter(!is.na(oslaua), oslaua != "", !is.na(weight)) %>%
+  select(id, wave, registered, oslaua, weight)
+
+# LA lookups
+la_history <- read_excel("LA History.xlsx")
+la_codes   <- read_csv("LA_codes_2023.csv")
+
+oslaua_registration_named <- oslaua_registration %>%
+  left_join(la_codes,   by = c("oslaua" = "LAD23CD")) %>%
+  left_join(la_history, by = c("oslaua" = "OLD_GSS_CODE")) %>%
+  mutate(LAD23NM = coalesce(LAD23NM, NEW_NAME)) %>%
+  filter(!is.na(LAD23NM))
+
+registration_rates <- oslaua_registration_named %>%
+  group_by(LAD23NM) %>%
+  summarise(
+    total_weighted      = sum(weight, na.rm = TRUE),
+    registered_weighted = sum(weight * (registered == "Yes"), na.rm = TRUE),
+    registration_rate   = registered_weighted / total_weighted,
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(registration_rate))
+
+top_10_oslaua    <- registration_rates %>% filter(n >= 100) %>% slice_head(n = 10)
+bottom_10_oslaua <- registration_rates %>% slice_tail(n = 10)
+
+no_registration_counts <- oslaua_registration_named %>%
+  group_by(LAD23NM) %>%
+  summarise(
+    total_weighted           = sum(weight, na.rm = TRUE),
+    no_registered_weighted   = sum(weight * (registered == "No"), na.rm = TRUE),
+    proportion_no_registered = no_registered_weighted / total_weighted,
+    no_registered_n          = sum(registered == "No", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_no_registered))
+
+top_10_no_oslaua <- no_registration_counts %>% slice_head(n = 10)
+
+# ============================== END OF SCRIPT ================================
